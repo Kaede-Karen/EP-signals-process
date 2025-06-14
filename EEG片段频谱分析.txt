@@ -1,0 +1,154 @@
+%% 0. 初始化环境 | Environment Initialization
+clc;                        % 清空命令窗口 | Clear command window
+
+% 读取EEG信号数据 | Read EEG signal data
+signal = EEG;                % 假设EEG变量已加载 | Assume EEG variable is loaded
+
+% 设置采样频率（根据实际EEG设备参数修改！）| Set sampling frequency (modify according to device specs)
+Fs = 125;                  % 示例值，需根据实际采样率修改 | Example value, modify as needed
+
+%% 1. 信号预处理 | Signal Preprocessing
+% 1.1 带通滤波去除噪声 | Bandpass filtering to remove noise
+fc_low = 0.3;                 % 低频截止频率 | Low-frequency cutoff
+fc_high = 25;               % 高频截止频率 | High-frequency cutoff
+[b, a] = butter(4, [fc_low/(Fs/2) fc_high/(Fs/2)], 'bandpass'); 
+filtered_signal = filtfilt(b, a, signal); 
+
+% 1.2 去除基线漂移 | Remove baseline drift
+filtered_signal = detrend(filtered_signal);
+
+%% 2. 时域分析 | Time-domain Analysis
+% 生成时间轴 | Generate time axis
+t = (0:length(filtered_signal)-1)/Fs;
+
+% 绘制时间-振幅图 | Plot time-amplitude graph
+figure('Name', 'EEG时间-振幅图 | EEG Time-Amplitude Plot', 'Position', [100 100 1000 400]);
+plot(t, filtered_signal, 'Color', [0.2 0.6 0.8], 'LineWidth', 1.2);
+title('EEG时间-振幅图 | EEG Time-Amplitude Plot');
+xlabel('Time (s)');
+ylabel('Amplitude (μV)');
+xlim([0 t(end)]);
+grid on;
+set(gca, 'FontSize', 11, 'GridAlpha', 0.3);
+saveas(gcf, 'EEG_Time_Amplitude.png');
+
+% 导出时域数据 | Export time-domain data
+time_amplitude_data = [t(:), filtered_signal(:)];
+writecell({'Time(s)', 'Amplitude(μV)'}, 'Time_Amplitude_Data.txt', 'Delimiter', 'tab');
+writematrix(time_amplitude_data, 'Time_Amplitude_Data.txt', 'Delimiter', 'tab', 'WriteMode', 'append');
+
+%% 3. 频域分析 | Frequency-domain Analysis
+% 计算功率谱密度（PSD）| Calculate power spectral density (PSD)
+nfft_psd = 2^nextpow2(length(filtered_signal)); 
+[P_per, f] = periodogram(filtered_signal, [], nfft_psd, Fs); 
+
+% 限定频率范围 | Limit frequency range
+f_lim = f((f > 0) & (f <= 20)); 
+P_per_lim = P_per((f > 0) & (f <= 20));
+
+% 绘制频率-PSD图 | Plot frequency-PSD graph
+figure('Name', 'EEG频率-PSD图 | EEG Frequency-PSD Plot', 'Position', [100 100 1000 400]);
+plot(f_lim, P_per_lim, 'k', 'LineWidth', 1);
+xlabel('Frequency (Hz)');
+ylabel('Power (μV^2/Hz)');
+title('Periodogram (Linear Scale)');
+set(gca, 'FontSize', 11, 'xlim', [min(f_lim), max(f_lim)]);
+saveas(gcf, 'EEG_Frequency_PSD.png');
+
+% 导出频域数据 | Export frequency-domain data
+frequency_psd_data = [f_lim(:), P_per_lim(:)];
+writecell({'Frequency(Hz)', 'PSD(μV^2/Hz)'}, 'Frequency_PSD_Data.txt', 'Delimiter', 'tab');
+writematrix(frequency_psd_data, 'Frequency_PSD_Data.txt', 'Delimiter', 'tab', 'WriteMode', 'append');
+
+%% 4. 幅频图分析 | Amplitude-Frequency Analysis
+% 计算信号的FFT幅度谱 | Calculate FFT amplitude spectrum
+nfft_amp = 2^nextpow2(length(filtered_signal)); 
+fft_amp = fft(filtered_signal, nfft_amp);       
+amplitude = abs(fft_amp) / length(filtered_signal); 
+amplitude = amplitude(1:nfft_amp/2+1);          
+amplitude(2:end-1) = 2*amplitude(2:end-1);      
+
+% 生成频率轴 | Generate frequency axis
+f_amp = Fs/2 * linspace(0, 1, nfft_amp/2+1);
+
+% 限定频率范围（3-30Hz）| Limit frequency range to 3-30Hz
+valid_freq = (f_amp >= 3) & (f_amp <= 30);
+f_amp_lim = f_amp(valid_freq);
+amplitude_lim = amplitude(valid_freq);
+
+% 绘制幅频图 | Plot amplitude-frequency graph
+figure('Name', 'EEG幅频图 | EEG Amplitude-Frequency Plot', 'Position', [100 100 1000 400]);
+plot(f_amp_lim, amplitude_lim, 'Color', [0.8 0.2 0.2], 'LineWidth', 1.5);
+xlabel('Frequency (Hz)');
+ylabel('Amplitude (μV)');
+title('EEG幅频图 | EEG Amplitude-Frequency Plot');
+grid on;
+set(gca, 'FontSize', 11, 'xlim', [3 30]);
+saveas(gcf, 'EEG_Amplitude_Frequency.png');
+
+% 导出幅频数据 | Export amplitude-frequency data
+amplitude_freq_data = [f_amp_lim(:), amplitude_lim(:)];
+writecell({'Frequency(Hz)', 'Amplitude(μV)'}, 'Amplitude_Frequency_Data.txt', 'Delimiter', 'tab');
+writematrix(amplitude_freq_data, 'Amplitude_Frequency_Data.txt', 'Delimiter', 'tab', 'WriteMode', 'append');
+
+%% 5. 时频域分析 | Time-frequency Analysis 
+% 短时傅里叶变换（STFT）| Short-time Fourier transform (STFT)
+window_length = round(4 * Fs); 
+noverlap = round(3 * Fs);      
+nfft_stft = 2^nextpow2(window_length * 2); 
+
+% 计算STFT | Calculate STFT
+[stft, f_stft, t_stft] = spectrogram(filtered_signal, hann(window_length), noverlap, nfft_stft, Fs, 'power');
+
+% 提取PSD并转换单位 | Extract PSD and convert units
+P_stft = abs(stft).^2 / (window_length * Fs); 
+
+% 平滑处理 | Smoothing processing
+P_stft_smooth = medfilt2(P_stft, [3, 3]); 
+
+% 生成原始物理坐标网格 | Original physical coordinates
+[X, Y] = meshgrid(t_stft, f_stft); 
+
+% 定义插值后的新坐标 | Interpolated coordinates
+x_new = linspace(min(t_stft), max(t_stft), length(t_stft)*10); 
+y_new = linspace(min(f_stft), max(f_stft), length(f_stft)*10); 
+
+% 生成查询网格 | Query grid
+[Xq, Yq] = meshgrid(x_new, y_new); 
+
+% 执行插值 | Interpolate
+P_stft_smooth_interpolated = interp2(X, Y, P_stft_smooth, Xq, Yq, 'cubic');
+
+% 绘制时间-频率-PSD图 | Plot time-frequency-PSD graph
+figure('Name', 'EEG时间-频率-PSD图 | EEG Time-Frequency-PSD Plot', 'Position', [100 100 1000 400]);
+imagesc(x_new, y_new, P_stft_smooth_interpolated); 
+colorbar;
+c = colorbar;
+c.Label.String = 'PSD (μV^2/Hz)';
+title('EEG时间-频率-PSD图 | EEG Time-Frequency-PSD Plot');
+xlabel('Time (s)');
+ylabel('Frequency (Hz)');
+ylim([4 16]);        
+xlim([0 10]);        
+set(gca, 'FontSize', 11);
+saveas(gcf, 'EEG_Time_Frequency_PSD.png');
+
+% 导出时频域数据 | Export time-frequency data
+time_frequency_psd_data = [];
+for i = 1:length(t_stft)
+    for j = 1:length(f_stft)
+        if f_stft(j) <= 40
+            time_frequency_psd_data = [time_frequency_psd_data; t_stft(i), f_stft(j), P_stft_smooth(j, i)];
+        end
+    end
+end
+
+writecell({'Time(s)', 'Frequency(Hz)', 'PSD(μV^2/Hz)'}, 'Time_Frequency_PSD_Data.txt', 'Delimiter', 'tab');
+writematrix(time_frequency_psd_data, 'Time_Frequency_PSD_Data.txt', 'Delimiter', 'tab', 'WriteMode', 'append');
+
+%% 6. 导出预处理信号 | Export Preprocessed Signal
+export_data = [t(:), signal(:), filtered_signal(:)];
+headers = {'Time(s)', 'Raw_Signal', 'Filtered_Signal'};
+writecell(headers, 'EEG_Data.txt', 'Delimiter', 'tab');
+writematrix(export_data, 'EEG_Data.txt', 'Delimiter', 'tab', 'WriteMode', 'append');
+disp('数据已导出为 EEG_Data.txt');

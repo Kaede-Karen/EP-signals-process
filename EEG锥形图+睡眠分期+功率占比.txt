@@ -1,0 +1,363 @@
+%% 睡眠分期分析系统 v3.1 (MATLAB 2020b+)
+%% 核心参数配置
+Fs = 125;                    % 采样率(Hz) 
+analysis_start = 1 * 60 * Fs; % 跳过前1分钟
+window_sec = 60;             % 分析窗口长度(秒) 
+smoothing_window = 3;        % 中值滤波窗口数 
+
+%% 数据加载接口
+% 从工作区读取EEG数据（需预加载EEG11变量）
+eeg_raw = evalin('base', 'EEG11') * 1000; % mV转μV 
+
+%% 创建结果文件夹
+results_folder = 'Sleep_Analysis_Results';
+if ~exist(results_folder, 'dir')
+    mkdir(results_folder);
+end
+
+%% 1. 信号预处理
+% 0.3-25Hz带通滤波器设计 
+[b, a] = butter(4, [0.3 25]/(Fs/2), 'bandpass');
+eeg_filtered = filtfilt(b, a, eeg_raw);
+
+% 50Hz陷波滤波器 
+wo = 50/(Fs/2); 
+[b, a] = iirnotch(wo, wo/35);
+eeg_clean = filtfilt(b, a, eeg_filtered);
+
+% 去除初始数据段
+eeg_clean(1:analysis_start) = [];
+
+%% --- 新增功能1: 滤波前后时间振幅图 ---
+figure('Position', [100 100 1000 500])
+
+% 原始信号
+subplot(2,1,1)
+t_raw = (1:length(eeg_raw))/Fs;
+plot(t_raw, eeg_raw, 'k', 'LineWidth', 0.5)
+title('原始EEG信号 (mV转μV)', 'FontSize', 12)
+xlabel('时间 (秒)'), ylabel('幅值 (μV)')
+grid on
+ylim([-500 500])
+
+% 滤波后信号
+subplot(2,1,2)
+t_clean = (analysis_start+1:length(eeg_raw))/Fs;
+plot(t_clean, eeg_clean, 'b', 'LineWidth', 0.8)
+title('滤波后EEG信号', 'FontSize', 12)
+xlabel('时间 (秒)'), ylabel('幅值 (μV)')
+grid on
+ylim([-500 500])
+
+% 保存滤波前后图像
+saveas(gcf, fullfile(results_folder, 'filtering_result.png'))
+
+% 保存滤波前后数据
+save(fullfile(results_folder, 'filtering_data.mat'), 't_raw', 'eeg_raw', 't_clean', 'eeg_clean')
+
+%% 2. 多锥形谱分析 (NW=3.5)
+window_samples = window_sec * Fs;
+num_windows = floor(length(eeg_clean)/window_samples);
+nfft = 2^nextpow2(window_samples);
+NW = 3.5; % 时间-带宽积 
+
+% 定义生理频段 (AASM标准) 
+freq_bands = [0.5  4;     % Delta (N3期)
+              4    8;     % Theta (REM期)
+              8   12;     % Alpha (清醒期)
+              12  15;     % Sigma (N2期纺锤波)
+              15  20];    % Beta (高频活动)
+
+% 时频矩阵计算
+spectrogram_power = zeros(num_windows, nfft/2+1);
+time_vector = zeros(num_windows,1);
+
+for i = 1:num_windows
+    idx = (i-1)*window_samples+1 : i*window_samples;
+    [pxx, f] = pmtm(eeg_clean(idx), NW, nfft, Fs);
+    spectrogram_power(i,:) = pxx; % 直接使用功率谱密度 μV²/Hz
+    time_vector(i) = (analysis_start/Fs + (i-0.5)*window_sec)/3600;
+end
+
+% 截取0-20Hz频段
+valid_freq = f <= 20;
+f = f(valid_freq);
+spectrogram_power = spectrogram_power(:,valid_freq);
+
+%% --- 新增功能2: 绘制时频图 ---
+figure('Position', [100 100 1000 300])
+imagesc(time_vector, f, spectrogram_power')
+axis xy
+colormap(jet)
+colorbar
+title('多锥形频谱分析 (μV²/Hz)')
+xlabel('时间 (小时)')
+ylabel('频率 (Hz)')
+
+% 保存时频图
+saveas(gcf, fullfile(results_folder, 'spectral_analysis.png'))
+
+%% 3. 能量计算与平滑处理
+% 计算各频段绝对功率
+delta_power = zeros(num_windows,1);
+theta_power = zeros(num_windows,1);
+alpha_power = zeros(num_windows,1);
+sigma_power = zeros(num_windows,1);
+beta_power = zeros(num_windows,1);
+
+total_power = sum(spectrogram_power,2);
+
+for i = 1:num_windows
+    delta_power(i) = sum(spectrogram_power(i, f >= 0.5 & f <= 4));
+    theta_power(i) = sum(spectrogram_power(i, f >= 4 & f <= 8));
+    alpha_power(i) = sum(spectrogram_power(i, f >= 8 & f <= 12));
+    sigma_power(i) = sum(spectrogram_power(i, f >= 12 & f <= 15));
+    beta_power(i) = sum(spectrogram_power(i, f >= 15 & f <= 20));
+end
+
+% 计算功率占比
+delta_ratio = delta_power ./ total_power * 100;
+theta_ratio = theta_power ./ total_power * 100;
+alpha_ratio = alpha_power ./ total_power * 100;
+sigma_ratio = sigma_power ./ total_power * 100;
+beta_ratio = beta_power ./ total_power * 100;
+
+% 平滑处理
+smoothed_ratio = zeros(num_windows,5);
+smoothed_ratio(:,1) = medfilt1(delta_ratio, smoothing_window);
+smoothed_ratio(:,2) = medfilt1(theta_ratio, smoothing_window);
+smoothed_ratio(:,3) = medfilt1(alpha_ratio, smoothing_window);
+smoothed_ratio(:,4) = medfilt1(sigma_ratio, smoothing_window);
+smoothed_ratio(:,5) = medfilt1(beta_ratio, smoothing_window);
+
+%% 动态睡眠分期（改进版）
+% 新增状态变量
+state_history = zeros(3, 1);  % 状态缓冲区
+unclassified = 0;             % 未分类计数器
+nearest_stage = 0;            % 最近有效阶段
+sigma_thresh = 12;            % Sigma波阈值（可根据需要调整）
+
+sleep_stage = zeros(num_windows, 1); % 初始化睡眠分期结果
+
+% 分期逻辑（调整后的规则）
+for i = 1:num_windows
+    delta = smoothed_ratio(i, 1);
+    theta = smoothed_ratio(i, 2);
+    alpha = smoothed_ratio(i, 3);
+    sigma = smoothed_ratio(i, 4);
+    beta = smoothed_ratio(i, 5);
+
+   % 根据能量占比进行分期
+    if delta > 50                             % N3 期
+        stage = 5;
+    elseif beta > 25 || alpha > 25            % 清醒期
+        stage = 1;
+    elseif (sigma > sigma_thresh || delta > 15) && delta <= 45 % N2 期
+        stage = 4;
+    elseif theta > 15  && beta < 15 && theta < 20 % REM期 
+        stage = 2;
+    elseif delta > 5 || theta > 10            % N1 期
+        stage = 3;
+    else
+        % 无法识别的状态，标记为0并进行特殊处理
+        unclassified = 1;
+        nearest_stage = 0;
+        stage = 0;
+    end
+
+
+    % 状态连续性约束和就近原则
+    if unclassified == 1
+        % 查找最近的有效阶段
+        for j = -2:2  % 检查前后3个窗口
+            if i + j >= 1 && i + j <= num_windows
+                candidate = sleep_stage(i + j);
+                if candidate ~= 0
+                    nearest_stage = candidate;
+                    break;
+                end
+            end
+        end
+        
+        % 应用就近原则
+        if nearest_stage ~= 0
+            stage = nearest_stage;
+        end
+        
+        % 重置状态
+        unclassified = 0;
+    else
+        % 正常状态更新
+        state_history = [state_history(2:end); stage];
+        if length(unique(state_history)) == 1
+            stage = mode(state_history);
+        end
+    end
+
+    sleep_stage(i) = stage;
+end
+
+%% --- 新增功能3: 绘制其他图表 ---
+figure('Position', [100 400 1400 900])
+
+% 功率绝对值随时间变化
+subplot(3,1,1)
+plot(time_vector, delta_power, 'k', 'LineWidth',1.5)
+hold on
+plot(time_vector, theta_power, 'r', 'LineWidth',1.5)
+plot(time_vector, alpha_power, 'g', 'LineWidth',1.5)
+plot(time_vector, sigma_power, 'b', 'LineWidth',1.5)
+plot(time_vector, beta_power, 'm', 'LineWidth',1.5)
+title('各频段绝对功率')
+legend({'Delta','Theta','Alpha','Sigma','Beta'}, 'Location','best')
+xlabel('时间 (小时)'), ylabel('功率 (μV²)')
+grid on
+
+% 功率占比随时间变化
+subplot(3,1,2)
+plot(time_vector, smoothed_ratio, 'LineWidth',1.5)
+title('动态能量分布')
+legend({'Delta','Theta','Alpha','Sigma','Beta'}, 'Location','best')
+xlabel('时间 (小时)'), ylabel('能量占比 (%)')
+grid on
+
+% 睡眠分期结果
+subplot(3,1,3)
+stairs(time_vector, sleep_stage, 'LineWidth',2, 'Color',[0.2 0.5 0.8])
+yticks(1:5), yticklabels({'清醒','REM','N1','N2','N3'})
+ylim([0.8 5.2]), grid on
+title('睡眠分期结果')
+xlabel('时间 (小时)')
+
+% 保存其他图表
+saveas(gcf, fullfile(results_folder, 'other_analysis.png'))
+
+%% --- 修改后功能4: 排除清醒期的时间占比 ---
+% 过滤数据（排除阶段1：清醒）
+valid_stages = sleep_stage(sleep_stage >= 2 & sleep_stage <= 5);
+
+% 重新计算各阶段占比（分母仅包含REM/N1/N2/N3总时长）
+stage_counts = histcounts(valid_stages, 2:6); % 分箱边界调整为2-6
+stage_labels = {'REM','N1','N2','N3'};        % 对应阶段2-5
+stage_percent = stage_counts / sum(stage_counts) * 100;
+
+% 验证数据完整性
+assert(abs(sum(stage_percent)-100) < 0.1, '百分比总和应为100%%');
+
+% 绘制专用配色柱状图
+figure('Position', [300 300 600 600])
+bar_obj = bar(stage_percent, 'FaceColor','flat', 'EdgeColor','k');
+bar_obj.CData = [0.9 0.7 1;   % REM紫色
+                 1   0.9 0.7; % N1橙色
+                 0.8 1   0.8; % N2绿色
+                 0.7 0.7 1];  % N3蓝色
+
+% 添加精确百分比标签
+for i = 1:length(stage_percent)
+    text(i, stage_percent(i)-3,...
+        sprintf('%.1f%%', stage_percent(i)),...
+        'HorizontalAlignment','center',...
+        'FontSize',12,...
+        'FontWeight','bold',...
+        'Color',[0.2 0.2 0.2]);
+end
+
+% 图表美化
+set(gca,'XTickLabel',stage_labels,...
+        'FontSize',12,...
+        'LineWidth',1.5)
+ylabel('时间占比 (%)','FontSize',12)
+title('核心睡眠阶段分布 (排除清醒期)','FontSize',14)
+grid on
+ylim([0 ceil(max(stage_percent)/10)*10 + 10]) % 自动调整Y轴范围
+
+% 保存新图表
+saveas(gcf, fullfile(results_folder, 'core_sleep_stages.png'))
+% 计算各阶段持续时间（分钟）
+stage_duration = (stage_counts * window_sec) / 60; 
+
+% 构建详细数据表
+stage_stats = table(stage_labels', stage_percent', stage_duration',...
+    'VariableNames', {'Stage','Percentage','Duration_min'});
+
+% 添加时间戳信息
+timing_info = cell(length(stage_labels),1);
+for i = 1:length(stage_labels)
+    stage_mask = sleep_stage == (i+1); % 阶段2-5对应标签1-4
+    start_times = time_vector(stage_mask)';
+    timing_info{i} = mat2str(round(start_times*60,1)); % 转换为分钟精度的字符串
+end
+
+stage_stats.TimeStamps_min = timing_info;
+
+% 保存为CSV和MAT文件
+writetable(stage_stats, fullfile(results_folder, 'stage_timing_details.csv'))
+save(fullfile(results_folder, 'stage_timing.mat'), 'stage_stats')
+
+%% 4. 数据导出（修正后）
+% 将smoothed_ratio拆分为独立变量
+delta_ratio = smoothed_ratio(:,1);
+theta_ratio = smoothed_ratio(:,2);
+alpha_ratio = smoothed_ratio(:,3);
+sigma_ratio = smoothed_ratio(:,4);
+beta_ratio = smoothed_ratio(:,5);
+
+% 生成扩展后的睡眠分期数据（每十秒一个点）
+num_10s_per_window = 6; % 每个60秒窗口对应6个十秒区间
+sleep_stage_expanded = repelem(sleep_stage, num_10s_per_window);
+time_10s = zeros(num_windows * num_10s_per_window, 1);
+
+for i = 1:num_windows
+    % 原窗口i的起始时间（秒）
+    t_start_sec = (analysis_start + (i-1)*window_samples) / Fs;
+    % 六个十秒区间的中点时间（秒）
+    t_mid_10s = t_start_sec + 5 + (0:5)*10; % 5,15,...,55秒
+    % 转换为小时
+    t_mid_hours = t_mid_10s / 3600;
+    % 填充到time_10s向量中
+    start_idx = (i-1)*num_10s_per_window + 1;
+    end_idx = i*num_10s_per_window;
+    time_10s(start_idx:end_idx) = t_mid_hours;
+end
+
+% 创建睡眠分期表格并保存
+sleep_stage_table = table(time_10s, sleep_stage_expanded, ...
+    'VariableNames', {'Time_h', 'Stage'});
+    
+% 检查文件是否存在，若存在则删除
+csv_file = fullfile(results_folder, 'sleep_stages.csv');
+if exist(csv_file, 'file')
+    delete(csv_file);
+end
+
+% 保存到CSV文件
+writetable(sleep_stage_table, csv_file);
+
+% 创建功率和占比的表格
+power_and_ratio = table(time_vector, ...
+    delta_power, theta_power, alpha_power, sigma_power, beta_power, ...
+    delta_ratio, theta_ratio, alpha_ratio, sigma_ratio, beta_ratio, ...
+    'VariableNames', {'Time_h', ...
+    'Delta_power', 'Theta_power', 'Alpha_power', 'Sigma_power', 'Beta_power', ...
+    'Delta_ratio', 'Theta_ratio', 'Alpha_ratio', 'Sigma_ratio', 'Beta_ratio'});
+
+% 检查文件是否存在，若存在则删除
+csv_file = fullfile(results_folder, 'power_and_ratio.csv');
+if exist(csv_file, 'file')
+    delete(csv_file);
+end
+
+% 保存到CSV文件
+writetable(power_and_ratio, csv_file);
+
+% 保存睡眠阶段统计
+stage_stats = table(stage_labels', stage_percent', 'VariableNames', {'Stage','Percentage'});
+csv_file = fullfile(results_folder, 'sleep_stage_stats.csv');
+if exist(csv_file, 'file')
+    delete(csv_file);
+end
+writetable(stage_stats, csv_file);
+
+% 显示保存完成的消息
+disp('分析完成，结果已保存至：');
+disp(results_folder);

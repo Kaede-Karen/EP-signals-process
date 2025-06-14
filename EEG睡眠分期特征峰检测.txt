@@ -1,0 +1,258 @@
+%% 睡眠EEG特征波检测系统（最终版）
+% 作者：智能助手
+% 版本：2.3
+% 更新说明：修复导出错误，优化时间显示精度
+
+%% 参数设置
+Fs = 125;                    % 采样率(Hz)
+analysis_start = 1 * 60 * Fs; % 跳过前1分钟
+window_sec = 30;             % 分析窗口长度(秒) 
+
+%% 数据加载接口
+eeg_raw = evalin('base', 'EEG11') * 1000; % mV转μV 
+
+%% 创建结果文件夹
+results_folder = 'Sleep_Analysis_Results111';
+if ~exist(results_folder, 'dir')
+    mkdir(results_folder);
+end
+
+%% 睡眠特征波检测参数
+% Spindle检测参数 (N2期)
+spindle_freq = [12 16];       % 频率范围(Hz)
+spindle_threshold = 2.0;     % 标准差倍数阈值
+spindle_duration = [0.5 2];  % 持续时间范围(s)
+
+% K-complex检测参数 (N2期)
+kcomplex_threshold = -40;     % 幅值阈值(μV)
+kcomplex_duration = [0.5 1.2];% 持续时间范围(s)
+
+% Slow wave检测参数 (N3期)
+slowwave_threshold = 40;      % 峰峰值阈值(μV)
+slowwave_freq = [0.5 2];     % 频率范围(Hz)
+
+%% 预处理滤波设计
+[b_spindle, a_spindle] = butter(4, spindle_freq/(Fs/2), 'bandpass');
+[b_slowwave, a_slowwave] = butter(2, slowwave_freq(2)/(Fs/2), 'low');
+
+%% 实时滤波处理
+eeg_spindle = filtfilt(b_spindle, a_spindle, eeg_raw);
+eeg_slowwave = filtfilt(b_slowwave, a_slowwave, eeg_raw);
+
+%% 特征波检测主程序
+window_samples = window_sec * Fs;
+total_samples = length(eeg_raw);
+current_sample = analysis_start + 1;
+
+detections = struct(...
+    'spindles', [],...    % [start, end](s)
+    'kcomplexes', [],...  % [peak_time](s)
+    'slowwaves', []);     % [start, end](s)
+
+progress = waitbar(0,'Processing EEG Data...');
+
+while current_sample + window_samples -1 <= total_samples
+    window_idx = current_sample : current_sample+window_samples-1;
+    
+    %% Spindle检测
+    window_data = eeg_spindle(window_idx);
+    envelope = abs(hilbert(window_data));
+    smooth_env = medfilt1(envelope, 3*Fs);
+    
+    threshold = median(smooth_env) + spindle_threshold*std(smooth_env);
+    [events, durations] = find_events(smooth_env > threshold, Fs);
+    valid = (durations >= spindle_duration(1)) & (durations <= spindle_duration(2));
+    detections.spindles = [detections.spindles; events(valid,:)+(current_sample-1)/Fs];
+    
+    %% K-complex检测
+    window_data = eeg_raw(window_idx);
+    [peaks, locs] = findpeaks(-window_data,...
+        'MinPeakHeight', -kcomplex_threshold,...
+        'MinPeakDistance', kcomplex_duration(1)*Fs);
+    
+    valid_peaks = validate_kcomplex(window_data, locs, Fs, kcomplex_duration);
+    detections.kcomplexes = [detections.kcomplexes; (locs(valid_peaks)+current_sample-1)/Fs];
+    
+    %% Slow wave检测
+    window_data = eeg_slowwave(window_idx);
+    [up_zero, down_zero] = zerocrossing(window_data);
+    
+    valid_waves = validate_slowwaves(window_data, up_zero, down_zero,...
+        slowwave_threshold, slowwave_freq, Fs);
+    events = [up_zero(valid_waves), down_zero(valid_waves)]/Fs + (current_sample-1)/Fs;
+    detections.slowwaves = [detections.slowwaves; events];
+    
+    %% 更新进度
+    progress = waitbar(current_sample/total_samples, progress,...
+        sprintf('Processed %.1f minutes', current_sample/Fs/60));
+    current_sample = current_sample + window_samples;
+end
+close(progress);
+
+%% 结果保存与导出
+save(fullfile(results_folder, 'detection_results.mat'), 'detections');
+export_to_origin(eeg_raw, eeg_slowwave, detections, Fs, results_folder);
+generate_sleep_report(eeg_raw, eeg_slowwave, Fs, detections, results_folder);
+
+disp('==== 分析完成 ====');
+fprintf('检测到：%d个纺锤波，%d个K复合波，%d个慢波\n',...
+    size(detections.spindles,1),...
+    length(detections.kcomplexes),...
+    size(detections.slowwaves,1));
+
+%% 辅助函数
+function [events, durations] = find_events(binary_vec, Fs)
+    transitions = diff([0; double(binary_vec(:)); 0]);
+    starts = find(transitions == 1);
+    ends = find(transitions == -1) - 1;
+    
+    durations = (ends - starts + 1)/Fs;
+    events = [starts, ends]/Fs;
+end
+
+function valid = validate_kcomplex(signal, locs, Fs, duration_range)
+    valid = false(size(locs));
+    for p = 1:length(locs)
+        start_idx = max(1, locs(p)-round(duration_range(2)*Fs/2));
+        end_idx = min(length(signal), locs(p)+round(duration_range(2)*Fs/2));
+        
+        duration = (end_idx - start_idx)/Fs;
+        valid_duration = duration >= duration_range(1) && duration <= duration_range(2);
+        
+        post_window = signal(locs(p):min(end,locs(p)+round(0.5*Fs)));
+        valid_morphology = any(post_window > 0.3*abs(signal(locs(p))));
+        
+        valid(p) = valid_duration && valid_morphology;
+    end
+end
+
+function [up, down] = zerocrossing(signal)
+    cross_idx = find(diff(sign(signal)) ~= 0);
+    up = cross_idx(signal(cross_idx) < 0);
+    down = cross_idx(signal(cross_idx) > 0);
+    
+    if ~isempty(up) && ~isempty(down)
+        if down(1) < up(1), down(1) = []; end
+        if up(end) > down(end), up(end) = []; end
+    end
+end
+
+function valid = validate_slowwaves(signal, up, down, threshold, freq_range, Fs)
+    valid = false(size(up));
+    for i = 1:length(up)
+        if down(i) - up(i) < 3, continue; end
+        
+        segment = signal(up(i):down(i));
+        pp_amp = max(segment) - min(segment);
+        
+        duration = (down(i)-up(i))/Fs;
+        valid_freq = duration >= 1/freq_range(2) && duration <= 1/freq_range(1);
+        
+        valid(i) = pp_amp >= threshold && valid_freq;
+    end
+end
+
+%% 可视化报告生成（时间轴以小时为单位）
+function generate_sleep_report(eeg_raw, eeg_slowwave, Fs, detections, folder)
+    t_h = (0:length(eeg_raw)-1)/Fs/3600; % 转换为小时
+    
+    fig = figure('Units','normalized','Position',[0.1 0.1 0.8 0.8],...
+        'Color','w');
+    
+    % 原始EEG
+    subplot(4,1,1)
+    plot(t_h, eeg_raw, 'Color',[0.2 0.4 0.6])
+    title('原始EEG信号','FontSize',12)
+    xlabel('时间 (小时)','FontSize',10)
+    ylabel('幅值 (μV)','FontSize',10)
+    xlim([0 t_h(end)])
+    grid on
+    
+    % 纺锤波检测
+    subplot(4,1,2)
+    plot(t_h, eeg_raw, 'Color',[0.5 0.5 0.5])
+    hold on
+    for i = 1:size(detections.spindles,1)
+        t_start = detections.spindles(i,1)/3600;
+        t_end = detections.spindles(i,2)/3600;
+        idx = round(detections.spindles(i,1)*Fs):round(detections.spindles(i,2)*Fs);
+        plot(t_h(idx+1), eeg_raw(idx+1), 'r')
+    end
+    title('纺锤波检测结果','FontSize',12)
+    xlim([0 t_h(end)])
+    grid on
+    
+    % K复合波标记
+    subplot(4,1,3)
+    plot(t_h, eeg_raw, 'Color',[0.5 0.5 0.5])
+    hold on
+    plot(detections.kcomplexes/3600, eeg_raw(round(detections.kcomplexes*Fs)+1), 'go')
+    title('K复合波检测结果','FontSize',12)
+    xlim([0 t_h(end)])
+    grid on
+    
+    % 慢波可视化
+    subplot(4,1,4)
+    plot(t_h, eeg_slowwave, 'Color',[0.3 0.7 0.3])
+    hold on
+    for i = 1:size(detections.slowwaves,1)
+        t_start = detections.slowwaves(i,1)/3600;
+        t_end = detections.slowwaves(i,2)/3600;
+        idx = round(detections.slowwaves(i,1)*Fs):round(detections.slowwaves(i,2)*Fs);
+        plot(t_h(idx+1), eeg_slowwave(idx+1), 'm')
+    end
+    title('慢波检测结果','FontSize',12)
+    xlabel('时间 (小时)','FontSize',10)
+    xlim([0 t_h(end)])
+    grid on
+    
+    print(fig, fullfile(folder, 'detection_report.png'), '-dpng', '-r300')
+    close(fig)
+end
+
+%% Origin数据导出（修复版）
+function export_to_origin(eeg_raw, eeg_slowwave, detections, Fs, folder)
+    % 时间数据保留10位有效数字
+    t = (0:length(eeg_raw)-1)/Fs;
+    t_str = compose('%.10f', t);
+    
+    % 创建表格数据
+    data_table = table(...
+        t(:), eeg_raw(:), eeg_slowwave(:),...
+        'VariableNames',{'Time_sec','Raw_EEG','Slowwave_EEG'});
+    
+    % 导出主数据
+    writetable(data_table,...
+        fullfile(folder, 'Origin_Data.csv'),...
+        'Delimiter',',',...
+        'WriteVariableNames',true);
+    
+    % 导出事件数据（保留10位精度）
+    if ~isempty(detections.spindles)
+        spindle_table = array2table(detections.spindles,...
+            'VariableNames',{'Start_sec','End_sec'});
+        spindle_table.Start_sec = round(spindle_table.Start_sec,10);
+        spindle_table.End_sec = round(spindle_table.End_sec,10);
+        writetable(spindle_table,...
+            fullfile(folder, 'Spindle_Events.csv'));
+    end
+    
+    if ~isempty(detections.kcomplexes)
+        kcomplex_table = table(...
+            round(detections.kcomplexes,10),...
+            'VariableNames',{'PeakTime_sec'});
+        writetable(kcomplex_table,...
+            fullfile(folder, 'Kcomplex_Events.csv'));
+    end
+    
+    if ~isempty(detections.slowwaves)
+        slowwave_table = array2table(detections.slowwaves,...
+            'VariableNames',{'Start_sec','End_sec'});
+        slowwave_table.Start_sec = round(slowwave_table.Start_sec,10);
+        slowwave_table.End_sec = round(slowwave_table.End_sec,10);
+        writetable(slowwave_table,...
+            fullfile(folder, 'Slowwave_Events.csv'));
+    end
+    
+    disp('Origin兼容文件已保存至结果文件夹');
+end

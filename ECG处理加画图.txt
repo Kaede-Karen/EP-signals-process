@@ -1,0 +1,76 @@
+%% 0. 初始化环境 | Environment Initialization
+clc;                        % 清空命令窗口 | Clear command window
+
+% 读取ECG信号数据 | Read ECG signal data
+signal = ECG;
+
+% 设置采样频率（根据实际ECG设备参数修改！）| Set sampling frequency (modify according to device specs)
+Fs = 1000; % 示例值，需根据实际采样率修改 | Example value, modify according to actual sampling rate
+
+%% 第一阶段：低通滤波预处理 | Stage 1: Lowpass filtering preprocessing
+% 设计目的：消除高频噪声干扰，包括50Hz工频干扰 | Purpose: Eliminate high-frequency noise interference, including 50Hz power frequency
+% 参数说明：40Hz截止频率，保留心电主要成分 | Parameters: 40Hz cutoff preserves main ECG components
+lowpass_filtered = lowpass(signal, 40, Fs);
+
+%% 第二阶段：信号功率计算 | Stage 2: Signal power calculation
+% 设计目的：计算去噪后信号的功率 | Purpose: Calculate the power of the denoised signal
+% 参数说明：通过平方和除以长度计算功率 | Parameters: Power calculated by sum of squares divided by length
+denoised_power = sum(lowpass_filtered.^2) / length(lowpass_filtered);
+
+%% 第三阶段：噪声功率计算 | Stage 3: Noise power calculation
+% 设计目的：计算噪声成分的功率 | Purpose: Calculate the power of the noise component
+% 参数说明：噪声成分是原始信号与去噪信号的差值 | Parameters: Noise component is the difference between original and denoised signals
+noise_component = signal - lowpass_filtered;
+noise_power = sum(noise_component.^2) / length(noise_component);
+
+%% 第四阶段：信噪比计算 | Stage 4: SNR Calculation
+% 设计目的：评估信号质量 | Purpose: Evaluate signal quality
+% 参数说明：信噪比通过信号功率与噪声功率比值的对数计算 | Parameters: SNR calculated as logarithm of signal power to noise power ratio
+SNR = 10 * log10(denoised_power / noise_power);
+disp(['优化后SNR: ', num2str(SNR, '%.2f'), ' dB']);
+
+%% 第五阶段：可视化模块 | Stage 5: Visualization Module
+% 生成时间轴 | Generate time axis
+t = (0:length(signal)-1)/Fs;
+
+% 原始信号可视化 | Raw signal visualization
+figure('Name','原始ECG信号 | Raw ECG Signal', 'Position', [100 100 1000 400])
+plot(t, signal, 'Color', [0.2 0.6 0.8], 'LineWidth', 1.2)
+title('原始ECG信号波形|Raw ECG signal waveform')
+xlabel('Time (s)')
+ylabel('Amplitude (mV)')
+xlim([0 t(end)])
+grid on
+set(gca, 'FontSize', 11, 'GridAlpha', 0.3)
+saveas(gcf, 'Raw_ECG_Signal.png')
+
+% 滤波后信号可视化 | Filtered signal visualization
+figure('Name','滤波后ECG信号 | Filtered ECG Signal', 'Position', [100 100 1000 400])
+plot(t, lowpass_filtered, 'Color', [0.8 0.2 0.2], 'LineWidth', 1.2)
+title('低通滤波后ECG波形| Filtered ECG waveform')
+xlabel('Time (s)')
+ylabel('Amplitude (mV)')
+xlim([0 t(end)])
+grid on
+set(gca, 'FontSize', 11, 'GridAlpha', 0.3)
+saveas(gcf, 'Filtered_ECG_Signal.png')
+
+disp('已生成可视化图像：Raw_ECG_Signal.png 和 Filtered_ECG_Signal.png');
+
+%% 第六阶段：导出数据至文本文件 | Stage 6: Export data to TXT
+% 设计目的：将处理后的数据保存到文本文件 | Purpose: Save processed data to a text file
+export_data = [t(:), signal(:), lowpass_filtered(:), noise_component(:)];
+
+% 创建表头
+headers = {'Time(s)', 'Raw_Signal', 'Lowpass_Filtered', 'Noise_Component', 'SNR(dB)'};
+
+% 将SNR值添加到导出数据的最后一列
+export_data = [export_data, repmat(SNR, length(t), 1)];
+
+% 写入表头
+writecell(headers, 'ECG_Data.txt', 'Delimiter', 'tab');
+
+% 写入数据
+writematrix(export_data, 'ECG_Data.txt', 'Delimiter', 'tab', 'WriteMode', 'append');
+
+disp('数据已导出为 ECG_Data.txt，包含SNR值');

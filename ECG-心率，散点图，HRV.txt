@@ -1,0 +1,224 @@
+clc; 
+warning('off', 'signal:findpeaks:largeMinPeakHeight');
+
+%% 参数配置
+Fs = 125;                    % 采样率 (Hz)
+analysis_start = 1 * 60 * Fs; % 跳过前1分钟数据
+results_folder = 'ECG_Analysis_Results';
+cutoff_freq = 40;            % 低通截止频率
+
+%% 创建结果文件夹
+if ~exist(results_folder, 'dir')
+    mkdir(results_folder);
+end
+
+%% 数据加载与预处理
+try
+    ecg_raw = evalin('base', 'ECG9'); 
+    ecg_raw = ecg_raw(analysis_start:end); 
+    time = (analysis_start:analysis_start+length(ecg_raw)-1)/Fs;  % 修正时间轴
+catch ME
+    error('数据加载失败: %s', ME.message);
+end
+
+%% 信号处理系统
+[b, a] = butter(4, cutoff_freq/(Fs/2), 'low');
+filtered_ecg = filtfilt(b, a, ecg_raw);
+
+%% 1. 绘制信号处理前后的时间-振幅图并保存数据
+figure('Position',[200 200 1200 400])
+subplot(2,1,1);
+plot(time, ecg_raw);
+title('Original ECG Signal');
+xlabel('Time (s)');
+ylabel('Amplitude');
+grid on;
+
+subplot(2,1,2);
+plot(time, filtered_ecg);
+title('Filtered ECG Signal');
+xlabel('Time (s)');
+ylabel('Amplitude');
+grid on;
+
+% 检查数组长度和维度
+disp(['time 长度: ' num2str(length(time)) '，维度: ' mat2str(size(time))]);
+disp(['ecg_raw 长度: ' num2str(length(ecg_raw)) '，维度: ' mat2str(size(ecg_raw))]);
+disp(['filtered_ecg 长度: ' num2str(length(filtered_ecg)) '，维度: ' mat2str(size(filtered_ecg))]);
+
+% 确保存储的数据长度一致
+min_length = min([length(time), length(ecg_raw), length(filtered_ecg)]);
+time = time(1:min_length);
+ecg_raw = ecg_raw(1:min_length);
+filtered_ecg = filtered_ecg(1:min_length);
+
+% 确保所有数组都是列向量
+time = time(:);
+ecg_raw = ecg_raw(:);
+filtered_ecg = filtered_ecg(:);
+
+% 验证数组的维度是否一致
+if ~isequal(size(time), size(ecg_raw)) || ~isequal(size(time), size(filtered_ecg))
+    error('数组维度不一致，无法拼接');
+end
+
+% 保存原始和滤波后的ECG信号数据为txt格式（带表头）
+ecg_data = [time, ecg_raw, filtered_ecg];
+fid = fopen(fullfile(results_folder, 'ECG_Raw_Filtered.txt'), 'w');
+fprintf(fid, 'Time(s)\tOriginalECG\tFilteredECG\n');
+fclose(fid);
+dlmwrite(fullfile(results_folder, 'ECG_Raw_Filtered.txt'), ecg_data, 'Delimiter', '\t', 'Precision', 10, '-append');
+
+%% 核心分析系统
+try
+    % R峰检测
+    [~, locs] = findpeaks(filtered_ecg, 'MinPeakHeight', median(filtered_ecg)+3.5*mad(filtered_ecg,1),...
+        'MinPeakDistance', 0.3*Fs);
+    peak_times = time(locs);
+    
+    %% 2. 绘制RR-RRn+1散点图并保存数据
+    rr_intervals = diff(peak_times); % 计算RR间期
+    
+    % 创建RRn vs RRn+1散点图
+    figure('Position',[200 200 800 600]);
+    scatter(rr_intervals(1:end-1), rr_intervals(2:end), 'filled');
+    title('RR_{n-1}RR_{n} vs RR_{n}RR_{n+1} Scatter Plot');
+    xlabel('RR_{n-1}R_{n} Intervals (s)');
+    ylabel('RR_{n}R_{n+1} Intervals (s)');
+    grid on;
+    hold on;
+    max_rr = max(rr_intervals);
+    plot([0 max_rr], [0 max_rr], 'k--');
+    hold off;
+    saveas(gcf, fullfile(results_folder, 'RR_Scatter_Plot.png'));
+    
+    % 保存RR间期数据为txt格式（带表头）
+    rr_data = [rr_intervals(1:end-1), rr_intervals(2:end)];
+    fid = fopen(fullfile(results_folder, 'RR_Intervals.txt'), 'w');
+    fprintf(fid, 'RRn-1_RRn_intervals(s)\tRRn_RRn+1_intervals(s)\n');
+    fclose(fid);
+    dlmwrite(fullfile(results_folder, 'RR_Intervals.txt'), rr_data, 'Delimiter', '\t', 'Precision', 10, '-append');
+    
+    %% 频谱图分析
+    % 使用RR间期进行频谱分析
+    rr_interpolated = interp1(peak_times(1:end-1), rr_intervals, peak_times, 'spline'); % 对RR间期进行插值
+    [psd, f] = pwelch(rr_interpolated, hann(256), 128, 256, Fs); % 频谱分析
+    
+    % 绘制频谱图
+    figure('Position',[200 200 1200 600]);
+    plot(f, 10*log10(psd));
+    title('Power Spectral Density of RR Intervals');
+    xlabel('Frequency (Hz)');
+    ylabel('Power/Frequency (dB/Hz)');
+    grid on;
+    saveas(gcf, fullfile(results_folder, 'RR_Spectrum.png'));
+    
+    % 保存频谱数据为txt格式（带表头）
+    spectrum_data = [f, psd];
+    fid = fopen(fullfile(results_folder, 'Power_Spectral_Density.txt'), 'w');
+    fprintf(fid, 'Frequency(Hz)\tPower_Spectral_Density\n');
+    fclose(fid);
+    dlmwrite(fullfile(results_folder, 'Power_Spectral_Density.txt'), spectrum_data, 'Delimiter', '\t', 'Precision', 10, '-append');
+    
+    %% 60秒窗口化处理
+    window_length = 60;
+    window_starts = time(1):window_length:time(end)-window_length;
+    if isempty(window_starts), window_starts = time(1); end
+    
+    % 预定义结果数组
+    hr_values = [];
+    sdnn_values = [];
+    rmssd_values = [];
+    nn50_values = [];
+    pnn50_values = [];
+    window_mid_times = [];
+    
+    for i = 1:length(window_starts)
+        try
+            t_start = window_starts(i);
+            t_end = t_start + window_length;
+            window_mid_time = (t_start + t_end) / 2;  % 使用时间窗口的中间点作为时间轴
+            
+            %% 当前窗口的R峰检测
+            window_mask = (peak_times >= t_start) & (peak_times < t_end);
+            window_peaks = peak_times(window_mask);
+            
+            %% 心率计算
+            num_beats = sum(window_mask);
+            window_duration = window_length; % 窗口长度为固定60秒
+            hr_value = (num_beats / window_duration) * 60;  % 转换为BPM
+            
+            %% HRV时域分析
+            sdnn = NaN; rmssd = NaN; nn50 = NaN; pnn50 = NaN;
+            if sum(window_mask) >= 2
+                rr_window = diff(window_peaks);
+                valid_rr = rr_window(rr_window>0.3 & rr_window<1.5);
+                
+                if length(valid_rr) >= 10
+                    sdnn = std(valid_rr)*1000;
+                    rmssd = sqrt(mean(diff(valid_rr).^2))*1000;
+                    nn50 = sum(abs(diff(valid_rr))>0.05);
+                    pnn50 = nn50/(length(valid_rr)-1)*100;
+                end
+            end
+            
+            %% 存储结果
+            window_mid_times = [window_mid_times; window_mid_time];
+            hr_values = [hr_values; hr_value];
+            sdnn_values = [sdnn_values; sdnn];
+            rmssd_values = [rmssd_values; rmssd];
+            nn50_values = [nn50_values; nn50];
+            pnn50_values = [pnn50_values; pnn50];
+            
+        catch ME
+            warning('窗口 %d 处理失败: %s', i, ME.message);
+        end
+    end
+    
+    % 保存HRV和心率数据为txt格式（带表头）
+    hrv_data = [window_mid_times, hr_values, sdnn_values, rmssd_values, nn50_values, pnn50_values];
+    fid = fopen(fullfile(results_folder, 'HRV_HR_Data.txt'), 'w');
+    fprintf(fid, 'Window_Mid_Time(s)\tHeart_Rate(BPM)\tSDNN(ms)\tRMSSD(ms)\tNN50\t pNN50(%%)\n');
+    fclose(fid);
+    dlmwrite(fullfile(results_folder, 'HRV_HR_Data.txt'), hrv_data, 'Delimiter', '\t', 'Precision', 10, '-append');
+    
+catch ME
+    warning('全局分析失败: %s', ME.message);
+end
+
+%% 可视化系统（带安全检查）
+if ~isempty(hr_values)
+    figure('Position',[200 200 1200 400]);
+    plot(window_mid_times/3600, hr_values, 'LineWidth',1.5);
+    xlabel('时间 (小时)'), ylabel('心率 (BPM)');
+    title('窗口化心率趋势分析');
+    grid on;
+    saveas(gcf, fullfile(results_folder, 'windowed_hr_trend.png'));
+else
+    warning('无法生成心率趋势图：无有效数据');
+end
+
+if ~isempty(sdnn_values) && ~isempty(rmssd_values)
+    figure('Position',[200 200 1200 800]);
+    subplot(2,1,1);
+    plot(window_mid_times/3600, sdnn_values, 'LineWidth',1.5);
+    title('SDNN时域分析'), ylabel('SDNN (ms)');
+    
+    subplot(2,1,2);
+    plot(window_mid_times/3600, rmssd_values, 'LineWidth',1.5);
+    title('RMSSD时域分析'), ylabel('RMSSD (ms)');
+    grid on;
+    saveas(gcf, fullfile(results_folder, 'windowed_hrv_trends.png'));
+end
+
+%% 生成报告
+disp('======== 分析报告 ========');
+if ~isempty(hr_values)
+    fprintf('平均心率: %.2f ± %.2f BPM\n', nanmean(hr_values), nanstd(hr_values));
+    fprintf('平均SDNN: %.2f ± %.2f ms\n', nanmean(sdnn_values), nanstd(sdnn_values));
+    fprintf('平均RMSSD: %.2f ± %.2f ms\n', nanmean(rmssd_values), nanstd(rmssd_values));
+    fprintf('平均NN50: %.2f ± %.2f\n', nanmean(nn50_values), nanstd(nn50_values));
+    fprintf('平均pNN50: %.2f ± %.2f %%\n', nanmean(pnn50_values), nanstd(pnn50_values));
+else
+    disp('未找到有效心率数据');
+end

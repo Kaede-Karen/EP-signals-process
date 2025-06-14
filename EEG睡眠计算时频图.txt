@@ -1,0 +1,84 @@
+%% 无线设备单通道信号分析系统
+
+%% 初始化环境
+clc;
+warning('off', 'signalfindpeakslargeMinPeakHeight');
+
+%% 1. 数据读取
+try
+    data = readtable('EEG_data_20250418T034206.csv');  
+    time = data{,1};      
+    ch1 = data{,9}1e3;       
+catch ME
+    error('数据读取失败，请检查文件路径和格式 %s', ME.message);
+end
+
+%% 2. 信号预处理系统
+% 2.1 计算采样率
+Fs = 1(time(2)-time(1));  
+fprintf('采样率计算完成 %.2f Hzn', Fs);
+
+% 2.2 低通滤波设计 (截止频率30Hz)
+[filter_b, filter_a] = butter(4, 30(Fs2), 'low');
+
+% 2.3 滤波处理
+filtered_ch1 = filtfilt(filter_b, filter_a, ch1);  
+filtered_ch1 = detrend(filtered_ch1);              
+
+%% 3. STFT计算（功率谱密度）
+windowDuration = 60;  % 窗口时长（秒）
+overlapDuration = 30;  % 重叠时长（秒）
+nfft = 1024;           % FFT点数
+
+windowSize = round(windowDuration  Fs);  % 窗口大小（点）
+overlap = round(overlapDuration  Fs);    % 重叠大小（点）
+
+% 使用PSD模式计算功率谱密度
+[s, f, t] = spectrogram(filtered_ch1, windowSize, overlap, nfft, Fs, 'psd');
+
+%% 4. 数据保存模块
+if ~exist('results', 'dir')
+    mkdir('results');  
+end
+
+% 保存STFT结果（含功率谱密度）
+stft_results = struct('Time', t, 'Frequency', f, 'Power', 10log10(abs(s)));
+save('resultsstft_results.mat', 'stft_results');
+fprintf('STFT结果已保存至 resultsstft_results.matn');
+
+%% 5. 时频图绘制（dBHz单位）
+figure('Position', [100 100 800 600], 'Renderer', 'painters');
+
+% 设置频率范围0-20Hz
+freqRange = f = 20;
+h = imagesc(t, f(freqRange), 10log10(abs(s(freqRange, )))); % 修正括号匹配
+axis xy;
+title('单通道信号功率谱密度');
+xlabel('时间 (秒)');
+ylabel('频率 (Hz)');
+hcb = colorbar;
+hcb.Label.String = '功率谱密度 (dBHz)';
+grid on;
+
+%% 6. 图片保存系统（修正版）
+save_dir = 'results';
+if ~exist(save_dir, 'dir')
+    mkdir(save_dir);
+end
+
+% 定义图像格式参数
+print_formats = {'-dpng', '-djpeg', '-dtiff'}; % 标准打印格式
+img_extensions = {'png', 'jpg', 'tiff'};       % 文件扩展名
+img_dpi = 300;
+
+for fmt_idx = 1numel(print_formats)
+    % 保存常规分辨率图像
+    saveas(gcf, fullfile(save_dir, ['spectrogram.' img_extensions{fmt_idx}]));
+    
+    % 保存高分辨率图像（显式指定图形句柄）
+    print(gcf, fullfile(save_dir, sprintf('spectrogram_highres_%d', fmt_idx)),...
+        print_formats{fmt_idx}, sprintf('-r%d', img_dpi));
+end
+
+%% 完成提示
+disp('分析流程已完成，结果已保存至 results');
